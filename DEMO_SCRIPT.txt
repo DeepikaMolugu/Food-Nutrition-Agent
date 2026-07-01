@@ -1,0 +1,86 @@
+FOOD NUTRITION AGENT — DEMO SCRIPT
+===================================
+Track: Agents for Good | Runtime: ~3–4 minutes
+===================================
+
+[0:00 — HOOK]
+
+Every day, millions of people eat meals without knowing what's actually in them. How many calories? Too much fat? What should I eat next? Getting answers used to mean visiting a dietitian or spending hours on calorie tracking apps. Not anymore.
+
+(pause)
+
+[0:20 — WHAT IT IS]
+
+This is the Food Nutrition Agent — an AI-powered nutrition assistant built on Google ADK 2.0, track Agents for Good. You simply describe your meal in plain language, and the agent identifies the food, estimates your calories and macros, suggests healthier alternatives, builds a personalized diet plan for the rest of your day, and tracks your daily nutrition — all in a single conversation.
+
+(pause)
+
+[0:40 — SHOW THE BANNER]
+
+(show assets/cover_page_banner.png)
+
+At a glance: AI-powered meal analysis, personalized diet planning, and daily nutrition tracking — powered by a multi-agent system running locally on your machine with Google's Gemini model.
+
+(pause)
+
+[1:00 — ARCHITECTURE]
+
+(show assets/architecture_diagram.png)
+
+Let me walk you through how this works.
+
+Every message first passes through the Security Checkpoint — a Python function node that scrubs personal information like phone numbers and email addresses, detects prompt injection attacks using 15 keyword patterns, and writes a structured audit log for every decision.
+
+If the message is safe, it reaches the Orchestrator — the root LlmAgent that coordinates the entire workflow.
+
+The Orchestrator first delegates to the Vision Analyst, which identifies every food item in your meal, estimates portion sizes, and detects the cooking method and cuisine.
+
+Then the Nutrition Analyst picks up those food items and uses the MCP Server to look up detailed nutritional data — calories, protein, carbs, fat, fiber — and gives your meal a Green, Yellow, or Red health rating, plus three specific healthier alternatives.
+
+The Diet Planner then uses the MCP Server to check your remaining calorie budget for the day and generates a personalized meal plan for the rest of your day, plus a 7-day weekly overview.
+
+Finally, the Nutrition Tracker logs your meal using the MCP Server and retrieves your running daily totals, showing your progress toward your goals with goal completion percentages.
+
+All four sub-agents connect to the same MCP Server through stdio transport, which exposes five specialized nutrition tools: get_nutrition_data, log_meal, get_daily_summary, get_healthier_alternatives, and generate_diet_plan.
+
+(pause)
+
+[2:00 — LIVE DEMO]
+
+(switch to playground at http://localhost:18081)
+
+Let me show you three real interactions.
+
+First — a classic snack scenario. I'll type: "I just had 2 samosas and a cup of masala chai."
+
+Watch what happens. The vision analyst identifies the samosas and chai. The nutrition analyst pulls data from the MCP server — that's around 524 calories, with a Yellow health rating because of the high fat content from frying. It immediately suggests healthier alternatives: baked vegetable cutlets, steamed momos, or roasted chickpeas. And the tracker logs this to my daily total.
+
+(pause — let the demo run)
+
+Second test — planning the rest of the day. I'll type: "I had pizza for lunch, 2 slices. What should I eat for the rest of the day to stay under 2000 calories?"
+
+The nutrition analyst calculates about 532 calories for those two slices. The diet planner then uses the remaining budget — roughly 1,468 calories — and generates specific, portioned meal suggestions for my afternoon snack and dinner, plus preparation tips.
+
+(pause — let the demo run)
+
+Third — checking my daily progress. I'll type: "Show me my nutrition progress for today."
+
+The tracker agent retrieves all the meals I've logged this session, adds them up, and shows me my total calories, protein, carbs, and fat as percentages of my daily goals — with an encouraging message about what to do next.
+
+(pause)
+
+[3:00 — SECURITY AND MCP]
+
+The security checkpoint runs before every single query. It automatically redacts email addresses, Indian Aadhar numbers, credit card numbers, and phone numbers — because people sometimes share personal health details without realizing it. Any message containing injection keywords like "ignore previous instructions" or "act as" is blocked with a CRITICAL severity audit log before it ever reaches the language model.
+
+The MCP Server is the backbone of all data operations — it handles nutrition lookups, meal logging, daily summaries, alternative suggestions, and diet plan generation, all running as a local subprocess with stdio transport. Zero cloud infrastructure required.
+
+(pause)
+
+[3:30 — IMPACT AND CLOSE]
+
+This agent helps anyone who wants to eat healthier — students, working professionals, people managing diabetes or weight — without needing to visit a dietitian or download yet another app. It makes expert nutrition guidance conversational, instant, and free.
+
+With one backend, it could power a WhatsApp chatbot, a mobile app, or a hospital patient portal. The architecture scales because the agents are modular — add a new sub-agent for meal planning by religion or cultural preference, and the orchestrator picks it up automatically.
+
+Thank you. The Food Nutrition Agent — making healthy eating as easy as a conversation.
