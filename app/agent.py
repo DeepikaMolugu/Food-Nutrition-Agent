@@ -342,12 +342,11 @@ class RetryWrapperNode(BaseNode):
                     is_503 = "503" in error_msg or (isinstance(e, ServerError) and e.code == 503)
 
                     if is_429:
-                        is_daily = "PerDay" in error_msg or "limit: 20" in error_msg or "limit: 0" in error_msg or "current quota" in error_msg
+                        is_daily = "perday" in error_msg.lower() or "daily" in error_msg.lower() or "limit: 0" in error_msg
                         if is_daily:
                             logger.error(f"Daily quota exhausted: {e}")
                             msg = "Your daily API quota has been exhausted. Please try again tomorrow or upgrade your plan."
                             yield msg
-                            self._cache[key] = [msg]
                             return
                         else:
                             # Transient rate limit (RPM)
