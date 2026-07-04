@@ -10,17 +10,74 @@ import logging
 from typing import Any, AsyncGenerator, ClassVar
 
 from google.adk.agents import LlmAgent
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.tools import AgentTool
 from google.adk.tools.mcp_tool import MCPToolset, StdioConnectionParams
 from google.adk.workflow import BaseNode
 from google.adk.agents.context import Context
 from google.adk.events import Event
-from google.genai.errors import ServerError
+from google.genai.errors import ServerError, ClientError
 from mcp.client.stdio import StdioServerParameters
 
 from app.config import config
 
 logger = logging.getLogger(__name__)
+
+class RetryingLlmAgent(LlmAgent):
+    async def _run_impl(
+        self,
+        *,
+        ctx: Context,
+        node_input: Any,
+    ) -> AsyncGenerator[Any, None]:
+        max_attempts = 5
+        delays = [2, 4, 8, 16]
+
+        for attempt in range(max_attempts):
+            try:
+                from google.adk.utils.context_utils import Aclosing
+                async with Aclosing(super()._run_impl(ctx=ctx, node_input=node_input)) as agen:
+                    async for event in agen:
+                        yield event
+                return
+            except Exception as e:
+                error_msg = str(e)
+                is_429 = "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg
+                is_503 = "503" in error_msg or "unavailable" in error_msg.lower() or (hasattr(e, "code") and e.code == 503) or isinstance(e, ServerError)
+
+                if is_429 or is_503:
+                    if attempt < max_attempts - 1:
+                        logger.warning(f"Agent {self.name} (run_impl) hit rate limit/busy (attempt {attempt+1}/{max_attempts}). Retrying in {delays[attempt]}s. Error: {e}")
+                        await asyncio.sleep(delays[attempt])
+                    else:
+                        raise
+                else:
+                    raise
+
+    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
+        max_attempts = 5
+        delays = [2, 4, 8, 16]
+
+        for attempt in range(max_attempts):
+            try:
+                from google.adk.utils.context_utils import Aclosing
+                async with Aclosing(super()._run_async_impl(ctx)) as agen:
+                    async for event in agen:
+                        yield event
+                return
+            except Exception as e:
+                error_msg = str(e)
+                is_429 = "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg
+                is_503 = "503" in error_msg or "unavailable" in error_msg.lower() or (hasattr(e, "code") and e.code == 503) or isinstance(e, ServerError)
+
+                if is_429 or is_503:
+                    if attempt < max_attempts - 1:
+                        logger.warning(f"Agent {self.name} (run_async_impl) hit rate limit/busy (attempt {attempt+1}/{max_attempts}). Retrying in {delays[attempt]}s. Error: {e}")
+                        await asyncio.sleep(delays[attempt])
+                    else:
+                        raise
+                else:
+                    raise
 
 from app.config import config
 
@@ -100,7 +157,7 @@ def run_security_check(user_input: str) -> str:
 # Sub-Agent 1: Vision Analyst
 # ─────────────────────────────────────────────────────────────────────────────
 
-vision_agent = LlmAgent(
+vision_agent = RetryingLlmAgent(
     name="vision_analyst",
     model=config.model,
     instruction="""You are an expert food recognition specialist.
@@ -123,7 +180,7 @@ Always respond with the food identification even if approximate.""",
 # Sub-Agent 2: Nutrition Analyst (uses MCP tools)
 # ─────────────────────────────────────────────────────────────────────────────
 
-nutrition_agent = LlmAgent(
+nutrition_agent = RetryingLlmAgent(
     name="nutrition_analyst",
     model=config.model,
     instruction="""You are a certified nutritionist and dietitian.
@@ -157,7 +214,7 @@ Be specific and encouraging.""",
 # Sub-Agent 3: Diet Planner (uses MCP tools)
 # ─────────────────────────────────────────────────────────────────────────────
 
-diet_planner_agent = LlmAgent(
+diet_planner_agent = RetryingLlmAgent(
     name="diet_planner",
     model=config.model,
     instruction="""You are a personalized diet planning expert.
@@ -191,7 +248,7 @@ Be practical and specific — name actual dishes, not vague categories.""",
 # Sub-Agent 4: Nutrition Tracker (uses MCP tools)
 # ─────────────────────────────────────────────────────────────────────────────
 
-tracker_agent = LlmAgent(
+tracker_agent = RetryingLlmAgent(
     name="nutrition_tracker",
     model=config.model,
     instruction="""You are a nutrition tracking specialist.
@@ -225,7 +282,7 @@ Be encouraging and specific.""",
 # Root Orchestrator Agent
 # ─────────────────────────────────────────────────────────────────────────────
 
-_root_orchestrator = LlmAgent(
+_root_orchestrator = RetryingLlmAgent(
     name="food_nutrition_orchestrator",
     model=config.model,
     instruction="""You are the Food Nutrition AI Orchestrator — a friendly, expert nutrition assistant.
@@ -267,8 +324,6 @@ Special cases:
 
 class RetryWrapperNode(BaseNode):
     target_node: BaseNode
-    _cache: ClassVar[dict[str, list[Any]]] = {}
-    _locks: ClassVar[dict[str, asyncio.Event]] = {}
 
     def __init__(self, target_node: BaseNode):
         super().__init__(
@@ -276,101 +331,53 @@ class RetryWrapperNode(BaseNode):
             target_node=target_node
         )
 
-    def _get_cache_key(self, node_input: Any) -> str:
-        try:
-            if hasattr(node_input, "parts") and node_input.parts:
-                parts_text = []
-                for p in node_input.parts:
-                    if hasattr(p, "text") and p.text:
-                        parts_text.append(p.text)
-                    elif isinstance(p, dict) and "text" in p:
-                        parts_text.append(p["text"])
-                return " ".join(parts_text).strip().lower()
-            elif isinstance(node_input, dict):
-                return json.dumps(node_input, sort_keys=True).lower()
-            return str(node_input).strip().lower()
-        except Exception:
-            return str(node_input).strip().lower()
-
     async def _run_impl(
         self,
         *,
         ctx: Context,
         node_input: Any,
     ) -> AsyncGenerator[Any, None]:
-        key = self._get_cache_key(node_input)
-
-        # Concurrency / Debounce Lock Check
-        if key in self._locks:
-            logger.info(f"Duplicate concurrent request for key: '{key}'. Waiting.")
-            await self._locks[key].wait()
-            if key in self._cache:
-                for event in self._cache[key]:
-                    yield event
-                return
-
-        # Cache Hit Check
-        if key in self._cache:
-            logger.info(f"Cache hit for key: '{key}'")
-            for event in self._cache[key]:
-                yield event
-            return
-
-        # Setup Concurrency Lock
-        self._locks[key] = asyncio.Event()
-        events_to_cache = []
-
         max_attempts = 5
         delays = [2, 4, 8, 16]
 
-        try:
-            for attempt in range(max_attempts):
-                try:
-                    if hasattr(ctx, "_output_value"):
-                        ctx._output_value = None
-                    async for event in self.target_node.run(ctx=ctx, node_input=node_input):
-                        events_to_cache.append(event)
-                        yield event
-                    
-                    # Store successfully completed runs in cache
-                    self._cache[key] = events_to_cache
-                    return
-                except Exception as e:
-                    events_to_cache.clear()
-                    error_msg = str(e)
-                    is_429 = "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg
-                    is_503 = "503" in error_msg or (isinstance(e, ServerError) and e.code == 503)
+        for attempt in range(max_attempts):
+            try:
+                if hasattr(ctx, "_output_value"):
+                    ctx._output_value = None
+                async for event in self.target_node.run(ctx=ctx, node_input=node_input):
+                    yield event
+                return
+            except Exception as e:
+                error_msg = str(e)
+                is_429 = "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg
+                is_503 = "503" in error_msg or (isinstance(e, ServerError) and e.code == 503)
 
-                    if is_429:
-                        is_daily = "perday" in error_msg.lower() or "daily" in error_msg.lower() or "limit: 0" in error_msg
-                        if is_daily:
-                            logger.error(f"Daily quota exhausted: {e}")
-                            msg = "Your daily API quota has been exhausted. Please try again tomorrow or upgrade your plan."
-                            yield msg
-                            return
-                        else:
-                            # Transient rate limit (RPM)
-                            if attempt < max_attempts - 1:
-                                yield f"Rate limit reached. Retrying in {delays[attempt]}s... (Attempt {attempt + 1}/{max_attempts})"
-                                await asyncio.sleep(delays[attempt])
-                            else:
-                                logger.error(f"Failed after rate limit retries: {e}")
-                                yield "Rate limit exceeded. Please try again in a few moments."
-                                return
-                    elif is_503:
+                if is_429:
+                    is_daily = "perday" in error_msg.lower() or "daily" in error_msg.lower() or "limit: 0" in error_msg
+                    if is_daily:
+                        logger.error(f"Daily quota exhausted: {e}")
+                        msg = "Your daily API quota has been exhausted. Please try again tomorrow or upgrade your plan."
+                        yield msg
+                        return
+                    else:
+                        # Transient rate limit (RPM)
                         if attempt < max_attempts - 1:
-                            yield f"The AI model is busy. Retrying... (Attempt {attempt + 1}/{max_attempts})"
+                            yield f"Rate limit reached. Retrying in {delays[attempt]}s... (Attempt {attempt + 1}/{max_attempts})"
                             await asyncio.sleep(delays[attempt])
                         else:
-                            logger.error(f"Failed after 503 retries: {e}")
-                            yield "The AI service is currently experiencing high demand. Please try again in a few moments."
+                            logger.error(f"Failed after rate limit retries: {e}")
+                            yield "Rate limit exceeded. Please try again in a few moments."
                             return
+                elif is_503:
+                    if attempt < max_attempts - 1:
+                        yield f"The AI model is busy. Retrying... (Attempt {attempt + 1}/{max_attempts})"
+                        await asyncio.sleep(delays[attempt])
                     else:
-                        raise
-        finally:
-            event_lock = self._locks.pop(key, None)
-            if event_lock:
-                event_lock.set()
+                        logger.error(f"Failed after 503 retries: {e}")
+                        yield "The AI service is currently experiencing high demand. Please try again in a few moments."
+                        return
+                else:
+                    raise
 
 
 root_agent = RetryWrapperNode(_root_orchestrator)
